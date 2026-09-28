@@ -44,11 +44,20 @@ export class ApiError extends Error {
   }
 }
 
+type Envelope<T> = {
+  ok: boolean;
+  message?: string | unknown;
+  data?: T;
+};
+
 async function parseError(res: Response): Promise<ApiError> {
   let message = `Request failed (${res.status})`;
   try {
-    const body = (await res.json()) as { detail?: string | { msg: string }[] };
-    if (typeof body.detail === "string") message = body.detail;
+    const body = (await res.json()) as Envelope<unknown> & {
+      detail?: string | { msg: string }[];
+    };
+    if (typeof body.message === "string") message = body.message;
+    else if (typeof body.detail === "string") message = body.detail;
     else if (Array.isArray(body.detail) && body.detail[0]?.msg) {
       message = body.detail[0].msg;
     }
@@ -74,13 +83,24 @@ async function apiFetch<T>(
   const res = await fetch(path, { ...options, headers });
   if (!res.ok) throw await parseError(res);
   if (res.status === 204) return undefined as T;
-  return (await res.json()) as T;
+  const body = (await res.json()) as Envelope<T>;
+  if (body && typeof body === "object" && "ok" in body) {
+    if (!body.ok) {
+      const msg =
+        typeof body.message === "string"
+          ? body.message
+          : `Request failed (${res.status})`;
+      throw new ApiError(res.status, msg);
+    }
+    return body.data as T;
+  }
+  return body as T;
 }
 
 export const api = {
   registerAccount(email: string, password: string, displayName?: string) {
     return apiFetch<TokenResponse>(
-      "/api/v1/auth/register-account",
+      "/auth/register",
       {
         method: "POST",
         body: JSON.stringify({
@@ -95,7 +115,7 @@ export const api = {
 
   login(email: string, password: string) {
     return apiFetch<TokenResponse>(
-      "/api/v1/auth/login",
+      "/auth/login",
       { method: "POST", body: JSON.stringify({ email, password }) },
       false,
     );
@@ -105,29 +125,29 @@ export const api = {
     const refresh = getRefreshToken();
     if (!refresh) return Promise.resolve();
     return apiFetch<void>(
-      "/api/v1/auth/logout",
+      "/auth/logout",
       { method: "POST", body: JSON.stringify({ refresh_token: refresh }) },
       false,
     ).catch(() => undefined);
   },
 
   getProfile() {
-    return apiFetch<UserProfile>("/api/v1/account/profile");
+    return apiFetch<UserProfile>("/account/profile");
   },
 
   updateProfile(displayName: string | null) {
-    return apiFetch<UserProfile>("/api/v1/account/profile", {
+    return apiFetch<UserProfile>("/account/profile", {
       method: "PATCH",
       body: JSON.stringify({ display_name: displayName }),
     });
   },
 
   getStorageQuota() {
-    return apiFetch<StorageQuota>("/api/v1/account/storage-quota");
+    return apiFetch<StorageQuota>("/account/storage-quota");
   },
 
   listFolderTree() {
-    return apiFetch<FolderTreeNode[]>("/api/v1/folders/list-folder-tree");
+    return apiFetch<FolderTreeNode[]>("/folders/tree");
   },
 
   listFolderContents(parentFolderId?: string | null) {
@@ -136,12 +156,12 @@ export const api = {
         ? ""
         : `?parent_folder_id=${encodeURIComponent(parentFolderId)}`;
     return apiFetch<{ parent_folder_id: string | null; folders: ApiFolder[] }>(
-      `/api/v1/folders/list-folder-contents${q}`,
+      `/folders/contents${q}`,
     );
   },
 
   createFolder(name: string, parentFolderId?: string | null) {
-    return apiFetch<ApiFolder>("/api/v1/folders/create-folder", {
+    return apiFetch<ApiFolder>("/folders", {
       method: "POST",
       body: JSON.stringify({
         name,
@@ -151,7 +171,7 @@ export const api = {
   },
 
   renameFolder(folderId: string, name: string) {
-    return apiFetch<ApiFolder>(`/api/v1/folders/${folderId}/rename-folder`, {
+    return apiFetch<ApiFolder>(`/folders/${folderId}`, {
       method: "PATCH",
       body: JSON.stringify({ name }),
     });
@@ -162,25 +182,25 @@ export const api = {
       folderId == null || folderId === ""
         ? ""
         : `?folder_id=${encodeURIComponent(folderId)}`;
-    return apiFetch<ApiFile[]>(`/api/v1/files/list-folder-files${q}`);
+    return apiFetch<ApiFile[]>(`/files${q}`);
   },
 
   renameFile(fileId: string, fileName: string) {
-    return apiFetch<ApiFile>(`/api/v1/files/${fileId}/rename-file`, {
+    return apiFetch<ApiFile>(`/files/${fileId}`, {
       method: "PATCH",
       body: JSON.stringify({ file_name: fileName }),
     });
   },
 
   moveFile(fileId: string, destinationFolderId: string | null) {
-    return apiFetch<ApiFile>(`/api/v1/files/${fileId}/move-file`, {
+    return apiFetch<ApiFile>(`/files/${fileId}/move`, {
       method: "POST",
       body: JSON.stringify({ destination_folder_id: destinationFolderId }),
     });
   },
 
   moveFolder(folderId: string, destinationParentFolderId: string | null) {
-    return apiFetch<ApiFolder>(`/api/v1/folders/${folderId}/move-folder`, {
+    return apiFetch<ApiFolder>(`/folders/${folderId}/move`, {
       method: "POST",
       body: JSON.stringify({
         destination_parent_folder_id: destinationParentFolderId,
@@ -194,7 +214,7 @@ export const api = {
     granteeEmail: string;
     role?: "viewer" | "editor";
   }) {
-    return apiFetch<ShareResponse>("/api/v1/shares/create-user-share", {
+    return apiFetch<ShareResponse>("/shares/user", {
       method: "POST",
       body: JSON.stringify({
         resource_type: input.resourceType,
@@ -210,7 +230,7 @@ export const api = {
     resourceId: string;
     role?: "viewer" | "editor";
   }) {
-    return apiFetch<ShareResponse>("/api/v1/shares/create-link-share", {
+    return apiFetch<ShareResponse>("/shares/link", {
       method: "POST",
       body: JSON.stringify({
         resource_type: input.resourceType,
@@ -226,7 +246,7 @@ export const api = {
     access: "restricted" | "anyone";
     role?: "viewer" | "editor";
   }) {
-    return apiFetch<ResourceAccess>("/api/v1/shares/set-link-access", {
+    return apiFetch<ResourceAccess>("/shares/link-access", {
       method: "POST",
       body: JSON.stringify({
         resource_type: input.resourceType,
@@ -242,28 +262,26 @@ export const api = {
       resource_type: resourceType,
       resource_id: resourceId,
     });
-    return apiFetch<ResourceAccess>(
-      `/api/v1/shares/list-resource-access?${params}`,
-    );
+    return apiFetch<ResourceAccess>(`/shares/resource-access?${params}`);
   },
 
   listMyShares() {
-    return apiFetch<ShareResponse[]>("/api/v1/shares/list-my-shares");
+    return apiFetch<ShareResponse[]>("/shares/mine");
   },
 
   listSharedWithMe() {
-    return apiFetch<SharedWithMeItem[]>("/api/v1/shares/list-shared-with-me");
+    return apiFetch<SharedWithMeItem[]>("/shares/shared-with-me");
   },
 
   revokeShare(shareId: string) {
-    return apiFetch<void>(`/api/v1/shares/${shareId}/revoke-share`, {
+    return apiFetch<void>(`/shares/${shareId}/revoke`, {
       method: "POST",
     });
   },
 
   accessSharedLink(token: string) {
     return apiFetch<SharedLinkAccess>(
-      `/api/v1/shares/access-shared-link/${encodeURIComponent(token)}`,
+      `/shares/link/${encodeURIComponent(token)}`,
       {},
       false,
     );
@@ -274,9 +292,8 @@ export const api = {
       resource_type: resourceType,
       resource_id: resourceId,
     });
-    // Send auth if present so allowed users open directly.
     return apiFetch<ResolveSharedItem>(
-      `/api/v1/shares/resolve-shared-item?${params}`,
+      `/shares/resolve?${params}`,
       {},
       Boolean(getAccessToken()),
     );
@@ -288,7 +305,7 @@ export const api = {
     role?: "viewer" | "editor";
     message?: string;
   }) {
-    return apiFetch<AccessRequestItem>("/api/v1/shares/request-access", {
+    return apiFetch<AccessRequestItem>("/shares/access-requests", {
       method: "POST",
       body: JSON.stringify({
         resource_type: input.resourceType,
@@ -304,23 +321,20 @@ export const api = {
       resource_type: resourceType,
       resource_id: resourceId,
     });
-    return apiFetch<AccessRequestItem[]>(
-      `/api/v1/shares/list-access-requests?${params}`,
-    );
+    return apiFetch<AccessRequestItem[]>(`/shares/access-requests?${params}`);
   },
 
   approveAccessRequest(requestId: string) {
     return apiFetch<ShareResponse>(
-      `/api/v1/shares/access-requests/${requestId}/approve`,
+      `/shares/access-requests/${requestId}/approve`,
       { method: "POST" },
     );
   },
 
   denyAccessRequest(requestId: string) {
-    return apiFetch<void>(
-      `/api/v1/shares/access-requests/${requestId}/deny`,
-      { method: "POST" },
-    );
+    return apiFetch<void>(`/shares/access-requests/${requestId}/deny`, {
+      method: "POST",
+    });
   },
 
   listSharedLinkContents(token: string, folderId?: string | null) {
@@ -328,7 +342,7 @@ export const api = {
     if (folderId) params.set("folder_id", folderId);
     const qs = params.toString();
     return apiFetch<SharedLinkContents>(
-      `/api/v1/shares/link/${encodeURIComponent(token)}/contents${qs ? `?${qs}` : ""}`,
+      `/shares/link/${encodeURIComponent(token)}/contents${qs ? `?${qs}` : ""}`,
       {},
       false,
     );
@@ -343,7 +357,7 @@ export const api = {
       size_bytes: number;
       mime_type: string | null;
     }>(
-      `/api/v1/shares/link/${encodeURIComponent(token)}/files/${fileId}/download-url`,
+      `/shares/link/${encodeURIComponent(token)}/files/${fileId}/download-url`,
       {},
       false,
     );
@@ -357,7 +371,7 @@ export const api = {
       expires_in_seconds: number;
       mime_type: string | null;
     }>(
-      `/api/v1/shares/link/${encodeURIComponent(token)}/files/${fileId}/preview-url`,
+      `/shares/link/${encodeURIComponent(token)}/files/${fileId}/preview-url`,
       {},
       false,
     );
@@ -371,7 +385,7 @@ export const api = {
       expires_in_seconds: number;
       mime_type: string | null;
     }>(
-      `/api/v1/shares/link/${encodeURIComponent(token)}/files/${fileId}/thumbnail-url`,
+      `/shares/link/${encodeURIComponent(token)}/files/${fileId}/thumbnail-url`,
       {},
       false,
     );
@@ -382,7 +396,7 @@ export const api = {
       file_id: string;
       upload_url: string;
       required_headers: Record<string, string>;
-    }>("/api/v1/files/request-upload-url", {
+    }>("/files/upload-url", {
       method: "POST",
       body: JSON.stringify({
         file_name: file.name,
@@ -399,7 +413,7 @@ export const api = {
     });
     if (!put.ok) throw new ApiError(put.status, "Upload to storage failed");
 
-    return apiFetch<ApiFile>(`/api/v1/files/${meta.file_id}/complete-upload`, {
+    return apiFetch<ApiFile>(`/files/${meta.file_id}/complete-upload`, {
       method: "POST",
     });
   },
@@ -408,66 +422,61 @@ export const api = {
     return apiFetch<{
       download_url: string;
       file_name: string;
-    }>(`/api/v1/files/${fileId}/request-download-url`);
+    }>(`/files/${fileId}/download-url`);
   },
 
   async getPreviewUrl(fileId: string) {
     return apiFetch<{
       preview_url: string;
       mime_type: string | null;
-    }>(`/api/v1/previews/${fileId}/request-preview-url`);
+    }>(`/previews/${fileId}/preview-url`);
   },
 
   async getThumbnailUrl(fileId: string) {
     return apiFetch<{
       preview_url: string;
       mime_type: string | null;
-    }>(`/api/v1/previews/${fileId}/request-thumbnail-url`);
+    }>(`/previews/${fileId}/thumbnail-url`);
   },
 
   listTrash() {
-    return apiFetch<{ items: TrashItem[] }>("/api/v1/trash/list-trash-items");
+    return apiFetch<{ items: TrashItem[] }>("/trash");
   },
 
   moveFileToTrash(fileId: string) {
-    return apiFetch<ApiFile>(`/api/v1/trash/files/${fileId}/move-file-to-trash`, {
+    return apiFetch<ApiFile>(`/trash/files/${fileId}`, {
       method: "POST",
     });
   },
 
   restoreFileFromTrash(fileId: string) {
-    return apiFetch<ApiFile>(
-      `/api/v1/trash/files/${fileId}/restore-file-from-trash`,
-      { method: "POST" },
-    );
+    return apiFetch<ApiFile>(`/trash/files/${fileId}/restore`, {
+      method: "POST",
+    });
   },
 
   permanentlyDeleteFile(fileId: string) {
-    return apiFetch<void>(
-      `/api/v1/trash/files/${fileId}/permanently-delete-file`,
-      { method: "POST" },
-    );
+    return apiFetch<void>(`/trash/files/${fileId}/delete`, {
+      method: "POST",
+    });
   },
 
   moveFolderToTrash(folderId: string) {
-    return apiFetch<ApiFolder>(
-      `/api/v1/trash/folders/${folderId}/move-folder-to-trash`,
-      { method: "POST" },
-    );
+    return apiFetch<ApiFolder>(`/trash/folders/${folderId}`, {
+      method: "POST",
+    });
   },
 
   restoreFolderFromTrash(folderId: string) {
-    return apiFetch<ApiFolder>(
-      `/api/v1/trash/folders/${folderId}/restore-folder-from-trash`,
-      { method: "POST" },
-    );
+    return apiFetch<ApiFolder>(`/trash/folders/${folderId}/restore`, {
+      method: "POST",
+    });
   },
 
   permanentlyDeleteFolder(folderId: string) {
-    return apiFetch<void>(
-      `/api/v1/trash/folders/${folderId}/permanently-delete-folder`,
-      { method: "POST" },
-    );
+    return apiFetch<void>(`/trash/folders/${folderId}/delete`, {
+      method: "POST",
+    });
   },
 
   searchDrive(q: string) {
@@ -475,6 +484,6 @@ export const api = {
       query: string;
       files: ApiFile[];
       folders: ApiFolder[];
-    }>(`/api/v1/search/search-drive?q=${encodeURIComponent(q)}`);
+    }>(`/search?q=${encodeURIComponent(q)}`);
   },
 };
