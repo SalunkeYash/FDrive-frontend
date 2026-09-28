@@ -1,11 +1,12 @@
-# FDrive web (Vite + React)
+# FDrive frontend (Vite + React)
 
-Drive UI lives in `apps/web` and talks to the FastAPI backend under `/api/v1`.
+Standalone web client for the FDrive API.
 
 ```bash
-cd apps/web
 npm install
 npm run dev
 ```
 
-Open http://localhost:5173 — Vite proxies `/api` to `http://localhost:8000`.
+Open http://localhost:5173. Vite proxies API routes (`/auth`, `/folders`, `/files`, …) to `http://localhost:8000`.
+
+API responses use `{ ok, message?, data? }`; `src/api/client.ts` unwraps `data` automatically.
