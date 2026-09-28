@@ -1,4 +1,4 @@
-import { useEffect, useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useParams } from "react-router-dom";
 import { DotLoader } from "react-spinners";
 import DropZone from "@/components/DropZone";
@@ -19,10 +19,21 @@ export default function FolderView() {
     filters,
     ensureFolderLoaded,
   } = useDrive();
+  const [folderReady, setFolderReady] = useState(false);
 
   useEffect(() => {
-    if (!folderId || loading) return;
-    void ensureFolderLoaded(folderId);
+    if (!folderId || loading) {
+      setFolderReady(false);
+      return;
+    }
+    let cancelled = false;
+    setFolderReady(false);
+    void ensureFolderLoaded(folderId).then(() => {
+      if (!cancelled) setFolderReady(true);
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [folderId, loading, ensureFolderLoaded]);
 
   const list = getByFolder(folderId);
@@ -41,7 +52,7 @@ export default function FolderView() {
   const hasUnfiltered =
     list.some((item) => item.isFolder && !item.isTrashed) ||
     list.some((item) => !item.isFolder && !item.isTrashed);
-  const isLoading = loading && !hasUnfiltered;
+  const isLoading = (loading || !folderReady) && !hasUnfiltered;
   const layoutClass =
     viewMode === "list"
       ? "flex w-full flex-col gap-0.5 text-textC"

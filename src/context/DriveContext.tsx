@@ -4,6 +4,7 @@ import {
   useContext,
   useEffect,
   useMemo,
+  useRef,
   useState,
   type Dispatch,
   type ReactNode,
@@ -23,35 +24,14 @@ import {
   type PeopleFilter,
   type TypeFilter,
 } from "@/lib/driveFilters";
+import {
+  clearThumbnailCache,
+  getCachedThumbnail,
+  requestThumbnailUrl,
+} from "@/lib/thumbnailFetch";
 
 const STARRED_KEY = "fdrive-starred-ids";
 const VIEW_MODE_KEY = "fdrive-view-mode";
-const IMAGE_EXTS = new Set([
-  "jpg",
-  "jpeg",
-  "png",
-  "gif",
-  "webp",
-  "ico",
-  "jfif",
-  "bmp",
-  "svg",
-  "heic",
-  "raw",
-  "cr2",
-  "cr3",
-  "nef",
-  "nrw",
-  "arw",
-  "dng",
-  "orf",
-  "rw2",
-  "pef",
-  "srw",
-  "raf",
-  "x3f",
-]);
-const VIDEO_EXTS = new Set(["mp4", "webm", "mov", "mkv", "m4v", "avi"]);
 
 type DriveContextValue = {
   entries: FileEntry[];
@@ -81,6 +61,7 @@ type DriveContextValue = {
   getByFolder: (folderId: string) => FileEntry[];
   getBreadcrumbs: (folderId: string) => { id: string; label: string }[];
   ensureFolderLoaded: (folderId: string) => Promise<void>;
+  requestThumbnail: (fileId: string) => Promise<string | null>;
   canEditFolder: (folderId: string) => boolean;
   openOrDownloadFile: (fileId: string, mode?: "open" | "download") => Promise<void>;
   downloadFolder: (folderId: string) => Promise<void>;
@@ -114,12 +95,6 @@ function saveStarred(ids: Set<string>) {
 
 function extensionOf(name: string): string {
   return name.includes(".") ? (name.split(".").pop()?.toLowerCase() ?? "") : "";
-}
-
-function isMediaEntry(entry: FileEntry): boolean {
-  const mime = (entry.mimeType || "").toLowerCase();
-  if (mime.startsWith("image/") || mime.startsWith("video/")) return true;
-  return IMAGE_EXTS.has(entry.fileExtension) || VIDEO_EXTS.has(entry.fileExtension);
 }
 
 function asAccessRole(
@@ -181,25 +156,16 @@ function mapFile(
 
 function flattenTree(
   nodes: FolderTreeNode[],
-): { id: string; name: string; parent_id: string | null }[] {
-  const out: { id: string; name: string; parent_id: string | null }[] = [];
+): { id: string; name: string; parent_id: string | null; path: string }[] {
+  const out: { id: string; name: string; parent_id: string | null; path: string }[] = [];
   const walk = (list: FolderTreeNode[]) => {
     for (const n of list) {
-      out.push({ id: n.id, name: n.name, parent_id: n.parent_id });
+      out.push({ id: n.id, name: n.name, parent_id: n.parent_id, path: n.path });
       if (n.children?.length) walk(n.children);
     }
   };
   walk(nodes);
   return out;
-}
-
-async function fetchThumbnailUrl(fileId: string): Promise<string | null> {
-  try {
-    const thumb = await api.getThumbnailUrl(fileId);
-    return thumb.preview_url;
-  } catch {
-    return null;
-  }
 }
 
 function loadViewMode(): ViewMode {
@@ -221,6 +187,8 @@ export function DriveProvider({ children }: { children: ReactNode }) {
   const [viewMode, setViewModeState] = useState<ViewMode>(() => loadViewMode());
   const [uploads, setUploads] = useState<UploadItem[]>([]);
   const [filters, setFilters] = useState<DriveFilters>(DEFAULT_FILTERS);
+  const loadedFoldersRef = useRef(new Set<string>());
+  const folderLoadInflightRef = useRef(new Map<string, Promise<void>>());
 
   const setViewMode = useCallback((mode: ViewMode) => {
     setViewModeState(mode);
@@ -243,67 +211,50 @@ export function DriveProvider({ children }: { children: ReactNode }) {
     setFilters(DEFAULT_FILTERS);
   }, []);
 
-  const hydrateThumbnails = useCallback(async (list: FileEntry[]) => {
-    const media = list.filter((e) => !e.isFolder && !e.isTrashed && isMediaEntry(e));
-    if (media.length === 0) return;
-
-    const updates = await Promise.all(
-      media.map(async (entry) => {
-        const url = await fetchThumbnailUrl(entry.id);
-        return url ? { id: entry.id, url } : null;
-      }),
-    );
-
-    const byId = new Map(
-      updates.filter((u): u is { id: string; url: string } => Boolean(u)).map((u) => [u.id, u.url]),
-    );
-    if (byId.size === 0) {
-      // Thumbs may still be generating — retry once shortly.
-      window.setTimeout(() => {
-        void (async () => {
-          const retry = await Promise.all(
-            media.map(async (entry) => {
-              const url = await fetchThumbnailUrl(entry.id);
-              return url ? { id: entry.id, url } : null;
-            }),
-          );
-          const retryMap = new Map(
-            retry
-              .filter((u): u is { id: string; url: string } => Boolean(u))
-              .map((u) => [u.id, u.url]),
-          );
-          if (retryMap.size === 0) return;
-          setEntries((prev) =>
-            prev.map((e) =>
-              retryMap.has(e.id) ? { ...e, fileLink: retryMap.get(e.id)! } : e,
-            ),
-          );
-        })();
-      }, 2500);
-      return;
+  const requestThumbnail = useCallback(async (fileId: string) => {
+    const cached = getCachedThumbnail(fileId);
+    if (cached) {
+      setEntries((prev) =>
+        prev.map((e) =>
+          e.id === fileId && e.fileLink !== cached ? { ...e, fileLink: cached } : e,
+        ),
+      );
+      return cached;
     }
-
-    setEntries((prev) =>
-      prev.map((e) => (byId.has(e.id) ? { ...e, fileLink: byId.get(e.id)! } : e)),
-    );
+    const url = await requestThumbnailUrl(fileId);
+    if (url) {
+      setEntries((prev) =>
+        prev.map((e) =>
+          e.id === fileId && e.fileLink !== url ? { ...e, fileLink: url } : e,
+        ),
+      );
+    }
+    return url;
   }, []);
 
   const refresh = useCallback(async () => {
     if (!user) {
       setEntries([]);
       setQuota(null);
+      loadedFoldersRef.current.clear();
+      folderLoadInflightRef.current.clear();
+      clearThumbnailCache();
       return;
     }
     setLoading(true);
+    loadedFoldersRef.current.clear();
+    folderLoadInflightRef.current.clear();
     try {
       const stars = loadStarred();
       setStarred(stars);
 
-      const [tree, trash, quotaData, rootFiles, myShares, sharedWithMe] =
+      // Root only — nested folder files load via ensureFolderLoaded when opened.
+      const [tree, trash, quotaData, rootContents, rootFiles, myShares, sharedWithMe] =
         await Promise.all([
           api.listFolderTree(),
           api.listTrash(),
           api.getStorageQuota(),
+          api.listFolderContents(null),
           api.listFolderFiles(null),
           api.listMyShares().catch(() => []),
           api.listSharedWithMe().catch(() => []),
@@ -312,24 +263,12 @@ export function DriveProvider({ children }: { children: ReactNode }) {
       const sharedIds = new Set(myShares.map((s) => s.resource_id));
       const myId = user.id;
 
-      const flatFolders = flattenTree(tree);
       const folderMeta = new Map<string, ApiFolder>();
-
-      const rootFolders = await api.listFolderContents(null);
-      for (const folder of rootFolders.folders) {
+      for (const folder of rootContents.folders) {
         folderMeta.set(folder.id, folder);
       }
-      await Promise.all(
-        flatFolders.map(async (folder) => {
-          try {
-            const child = await api.listFolderContents(folder.id);
-            for (const f of child.folders) folderMeta.set(f.id, f);
-          } catch {
-            /* ignore missing folder meta */
-          }
-        }),
-      );
 
+      const flatFolders = flattenTree(tree);
       const folderEntries: FileEntry[] = flatFolders.map((f) => {
         const meta = folderMeta.get(f.id);
         return mapFolder(
@@ -337,7 +276,7 @@ export function DriveProvider({ children }: { children: ReactNode }) {
             id: f.id,
             name: f.name,
             parent_id: f.parent_id,
-            path: "",
+            path: f.path || "",
             is_trashed: false,
             created_at: "",
             updated_at: "",
@@ -350,23 +289,14 @@ export function DriveProvider({ children }: { children: ReactNode }) {
         );
       });
 
-      const fileEntries: FileEntry[] = rootFiles.map((f) =>
-        mapFile(f, stars, sharedIds, {
+      const fileEntries: FileEntry[] = rootFiles.map((f) => {
+        const mapped = mapFile(f, stars, sharedIds, {
           accessRole: asAccessRole(f.access_role) ?? "owner",
           ownerId: f.owner_id ?? myId,
-        }),
-      );
-      for (const folder of flatFolders) {
-        const files = await api.listFolderFiles(folder.id);
-        fileEntries.push(
-          ...files.map((f) =>
-            mapFile(f, stars, sharedIds, {
-              accessRole: asAccessRole(f.access_role) ?? "owner",
-              ownerId: f.owner_id ?? myId,
-            }),
-          ),
-        );
-      }
+        });
+        const cached = getCachedThumbnail(f.id);
+        return cached ? { ...mapped, fileLink: cached } : mapped;
+      });
 
       const sharedEntries: FileEntry[] = [];
       for (const item of sharedWithMe) {
@@ -389,11 +319,12 @@ export function DriveProvider({ children }: { children: ReactNode }) {
             accessRole: role,
           });
         } else {
+          const cached = getCachedThumbnail(item.resource_id);
           sharedEntries.push({
             id: item.resource_id,
             folderName: "",
             isFolder: false,
-            fileLink: "",
+            fileLink: cached ?? "",
             fileName: item.resource_name,
             isStarred: stars.has(item.resource_id),
             isTrashed: false,
@@ -433,7 +364,6 @@ export function DriveProvider({ children }: { children: ReactNode }) {
       for (const e of [...folderEntries, ...fileEntries]) {
         byId.set(e.id, e);
       }
-      // Shared-with-me overlays (keep role if already owned — shouldn't happen)
       for (const e of sharedEntries) {
         const existing = byId.get(e.id);
         if (existing && existing.accessRole === "owner") continue;
@@ -443,10 +373,9 @@ export function DriveProvider({ children }: { children: ReactNode }) {
         byId.set(e.id, e);
       }
 
-      const next = [...byId.values()];
-      setEntries(next);
+      setEntries([...byId.values()]);
       setQuota(quotaData);
-      void hydrateThumbnails(next);
+      loadedFoldersRef.current.add("");
     } catch (err) {
       console.error("Failed to refresh drive data", err);
       try {
@@ -457,7 +386,7 @@ export function DriveProvider({ children }: { children: ReactNode }) {
     } finally {
       setLoading(false);
     }
-  }, [user, hydrateThumbnails]);
+  }, [user]);
 
   useEffect(() => {
     void refresh();
@@ -466,48 +395,66 @@ export function DriveProvider({ children }: { children: ReactNode }) {
   const ensureFolderLoaded = useCallback(
     async (folderId: string) => {
       if (!folderId || !user) return;
-      const stars = loadStarred();
-      try {
-        const [contents, files, myShares] = await Promise.all([
-          api.listFolderContents(folderId),
-          api.listFolderFiles(folderId),
-          api.listMyShares().catch(() => []),
-        ]);
-        const sharedIds = new Set(myShares.map((s) => s.resource_id));
-        const mediaEntries = files.map((f) => mapFile(f, stars, sharedIds));
+      if (loadedFoldersRef.current.has(folderId)) return;
 
-        setEntries((prev) => {
-          const parent = prev.find((e) => e.id === folderId);
-          const inherit = parent?.accessRole;
-          const fromShare = Boolean(parent?.isSharedWithMe);
-          const byId = new Map(prev.map((e) => [e.id, e]));
-          for (const f of contents.folders) {
-            byId.set(
-              f.id,
-              mapFolder(f, stars, sharedIds, {
-                accessRole: asAccessRole(f.access_role) ?? inherit,
-                isSharedWithMe: fromShare,
-              }),
-            );
-          }
-          for (const f of files) {
-            byId.set(
-              f.id,
-              mapFile(f, stars, sharedIds, {
-                accessRole: asAccessRole(f.access_role) ?? inherit,
-                isSharedWithMe: fromShare,
-              }),
-            );
-          }
-          return [...byId.values()];
-        });
-
-        void hydrateThumbnails(mediaEntries);
-      } catch (err) {
-        console.error("Failed to load shared folder contents", err);
+      const existing = folderLoadInflightRef.current.get(folderId);
+      if (existing) {
+        await existing;
+        return;
       }
+
+      const loadPromise = (async () => {
+        const stars = loadStarred();
+        try {
+          const [contents, files, myShares] = await Promise.all([
+            api.listFolderContents(folderId),
+            api.listFolderFiles(folderId),
+            api.listMyShares().catch(() => []),
+          ]);
+          const sharedIds = new Set(myShares.map((s) => s.resource_id));
+
+          setEntries((prev) => {
+            const parent = prev.find((e) => e.id === folderId);
+            const inherit = parent?.accessRole;
+            const fromShare = Boolean(parent?.isSharedWithMe);
+            const byId = new Map(prev.map((e) => [e.id, e]));
+
+            for (const [id, e] of [...byId]) {
+              if (e.folderId === folderId && !e.isTrashed) byId.delete(id);
+            }
+
+            for (const f of contents.folders) {
+              byId.set(
+                f.id,
+                mapFolder(f, stars, sharedIds, {
+                  accessRole: asAccessRole(f.access_role) ?? inherit,
+                  isSharedWithMe: fromShare,
+                }),
+              );
+            }
+            for (const f of files) {
+              const mapped = mapFile(f, stars, sharedIds, {
+                accessRole: asAccessRole(f.access_role) ?? inherit,
+                isSharedWithMe: fromShare,
+              });
+              const cached = getCachedThumbnail(f.id);
+              byId.set(f.id, cached ? { ...mapped, fileLink: cached } : mapped);
+            }
+            return [...byId.values()];
+          });
+
+          loadedFoldersRef.current.add(folderId);
+        } catch (err) {
+          console.error("Failed to load folder contents", err);
+        } finally {
+          folderLoadInflightRef.current.delete(folderId);
+        }
+      })();
+
+      folderLoadInflightRef.current.set(folderId, loadPromise);
+      await loadPromise;
     },
-    [user, hydrateThumbnails],
+    [user],
   );
 
   const addFolder = useCallback(
@@ -922,6 +869,7 @@ export function DriveProvider({ children }: { children: ReactNode }) {
       getByFolder,
       getBreadcrumbs,
       ensureFolderLoaded,
+      requestThumbnail,
       canEditFolder,
       openOrDownloadFile,
       downloadFolder,
@@ -952,6 +900,7 @@ export function DriveProvider({ children }: { children: ReactNode }) {
       getByFolder,
       getBreadcrumbs,
       ensureFolderLoaded,
+      requestThumbnail,
       canEditFolder,
       openOrDownloadFile,
       downloadFolder,

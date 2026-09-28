@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { BsThreeDotsVertical } from "react-icons/bs";
 import { FaPlay } from "react-icons/fa";
 import { useDrive } from "@/context/DriveContext";
@@ -29,6 +29,79 @@ const IMAGE_EXTS = [
   "raf",
 ];
 const VIDEO_EXTS = ["mp4", "webm", "mov", "mkv", "m4v"];
+
+function LazyMediaThumb({
+  fileId,
+  fileName,
+  fileLink,
+  isVideo,
+  fallback,
+  className,
+  imgClassName,
+}: {
+  fileId: string;
+  fileName: string;
+  fileLink: string;
+  isVideo: boolean;
+  fallback: React.ReactNode;
+  className?: string;
+  imgClassName: string;
+}) {
+  const { requestThumbnail } = useDrive();
+  const ref = useRef<HTMLDivElement | null>(null);
+  const [src, setSrc] = useState(fileLink);
+
+  useEffect(() => {
+    setSrc(fileLink);
+  }, [fileLink, fileId]);
+
+  useEffect(() => {
+    if (src) return;
+    const el = ref.current;
+    if (!el) return;
+
+    let cancelled = false;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (!entries.some((e) => e.isIntersecting)) return;
+        observer.disconnect();
+        void requestThumbnail(fileId).then((url) => {
+          if (!cancelled && url) setSrc(url);
+        });
+      },
+      { rootMargin: "160px" },
+    );
+    observer.observe(el);
+    return () => {
+      cancelled = true;
+      observer.disconnect();
+    };
+  }, [fileId, src, requestThumbnail]);
+
+  return (
+    <div ref={ref} className={className ?? "relative h-full w-full"}>
+      {src ? (
+        <>
+          <img
+            src={src}
+            alt={fileName}
+            draggable={false}
+            className={imgClassName}
+          />
+          {isVideo && (
+            <span className="absolute inset-0 flex items-center justify-center">
+              <span className="rounded-full bg-black/55 p-3 text-white">
+                <FaPlay className="h-4 w-4 translate-x-0.5" />
+              </span>
+            </span>
+          )}
+        </>
+      ) : (
+        fallback
+      )}
+    </div>
+  );
+}
 
 function GetFiles({ folderId, select }: { folderId: string; select: string }) {
   const [openMenu, setOpenMenu] = useState("");
@@ -111,25 +184,19 @@ function GetFiles({ folderId, select }: { folderId: string; select: string }) {
         const isVideo =
           VIDEO_EXTS.includes(file.fileExtension) ||
           (file.mimeType || "").startsWith("video/");
+        const isMedia = isImage || isVideo;
 
         let preview: React.ReactNode;
-        if ((isImage || isVideo) && file.fileLink) {
+        if (isMedia) {
           preview = (
-            <div className="relative h-full w-full">
-              <img
-                src={file.fileLink}
-                alt={file.fileName}
-                draggable={false}
-                className="h-full w-full rounded-sm object-cover object-center [image-orientation:from-image]"
-              />
-              {isVideo && (
-                <span className="absolute inset-0 flex items-center justify-center">
-                  <span className="rounded-full bg-black/55 p-3 text-white">
-                    <FaPlay className="h-4 w-4 translate-x-0.5" />
-                  </span>
-                </span>
-              )}
-            </div>
+            <LazyMediaThumb
+              fileId={file.id}
+              fileName={file.fileName}
+              fileLink={file.fileLink}
+              isVideo={isVideo}
+              fallback={<div className="flex h-full w-full items-center justify-center"><div className="h-36 w-36">{icon}</div></div>}
+              imgClassName="h-full w-full rounded-sm object-cover object-center [image-orientation:from-image]"
+            />
           );
         } else if (file.fileExtension === "mp3" && file.fileLink) {
           preview = (
@@ -153,12 +220,15 @@ function GetFiles({ folderId, select }: { folderId: string; select: string }) {
               className="relative flex w-full cursor-pointer items-center gap-3 rounded-lg px-3 py-2 hover:bg-darkC2"
             >
               <div className="flex h-10 w-10 shrink-0 items-center justify-center overflow-hidden rounded bg-darkC2">
-                {(isImage || isVideo) && file.fileLink ? (
-                  <img
-                    src={file.fileLink}
-                    alt=""
-                    className="h-full w-full object-cover [image-orientation:from-image]"
-                    draggable={false}
+                {isMedia ? (
+                  <LazyMediaThumb
+                    fileId={file.id}
+                    fileName=""
+                    fileLink={file.fileLink}
+                    isVideo={false}
+                    fallback={<div className="h-6 w-6">{icon}</div>}
+                    className="relative h-full w-full"
+                    imgClassName="h-full w-full object-cover [image-orientation:from-image]"
                   />
                 ) : (
                   <div className="h-6 w-6">{icon}</div>
